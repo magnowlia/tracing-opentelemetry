@@ -1,10 +1,10 @@
-use std::{collections::HashMap, fmt, sync::RwLock};
+use std::{collections::HashMap, fmt, ops::Deref, sync::RwLock};
 use tracing::{field::Visit, Subscriber};
-use tracing_core::{Field, Interest, Metadata};
+use tracing_core::{span::Record, Field, Interest, Metadata};
 
 use opentelemetry::{
     metrics::{Counter, Histogram, Meter, MeterProvider, UpDownCounter},
-    KeyValue, Value,
+    Key, KeyValue, OrderMap, Value,
 };
 use tracing_subscriber::{
     filter::Filtered,
@@ -145,9 +145,8 @@ pub(crate) struct MetricVisitor<'a> {
 }
 
 impl<'a> Visit for MetricVisitor<'a> {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.attributes
-            .push(KeyValue::new(field.name(), format!("{value:?}")));
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {
+        // Do nothing
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
@@ -335,6 +334,8 @@ impl<'a> Visit for MetricVisitor<'a> {
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub struct MetricsLayer<S> {
     inner: Filtered<InstrumentLayer, MetricsFilter, S>,
+    collect_contextual_attributes: bool,
+    contextual_attributes_filter: Option<fn(&Key) -> bool>,
 }
 
 impl<S> MetricsLayer<S>
@@ -359,14 +360,52 @@ where
         };
 
         MetricsLayer {
-            inner: layer.with_filter(MetricsFilter),
+            inner: layer.with_filter(MetricsFilter::default()),
+            collect_contextual_attributes: false,
+            contextual_attributes_filter: None,
+        }
+    }
+
+    pub fn new_with_contextual_attributes_filter<M>(
+        meter_provider: M,
+        filter: fn(&Key) -> bool,
+    ) -> MetricsLayer<S>
+    where
+        M: MeterProvider,
+    {
+        let meter = meter_provider.versioned_meter(
+            INSTRUMENTATION_LIBRARY_NAME,
+            Some(CARGO_PKG_VERSION),
+            None::<&'static str>,
+            None,
+        );
+
+        let layer = InstrumentLayer {
+            meter,
+            instruments: Default::default(),
+        };
+
+        MetricsLayer {
+            inner: layer
+                .with_filter(MetricsFilter::default().with_collect_contextual_attributes(true)),
+            collect_contextual_attributes: true,
+            contextual_attributes_filter: Some(filter),
         }
     }
 }
 
-struct MetricsFilter;
+#[derive(Default)]
+struct MetricsFilter {
+    collect_contextual_attributes: bool,
+}
 
 impl MetricsFilter {
+    fn with_collect_contextual_attributes(&self, collect_contextual_attributes: bool) -> Self {
+        MetricsFilter {
+            collect_contextual_attributes,
+        }
+    }
+
     fn is_metrics_event(&self, meta: &Metadata<'_>) -> bool {
         meta.is_event()
             && meta.fields().iter().any(|field| {
@@ -384,10 +423,18 @@ impl<S> Filter<S> for MetricsFilter {
     }
 
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
-        if self.is_metrics_event(meta) {
-            Interest::always()
+        if meta.is_span() {
+            if self.collect_contextual_attributes {
+                Interest::always()
+            } else {
+                Interest::never()
+            }
         } else {
-            Interest::never()
+            if self.is_metrics_event(meta) {
+                Interest::always()
+            } else {
+                Interest::never()
+            }
         }
     }
 }
@@ -401,7 +448,7 @@ impl<S> Layer<S> for InstrumentLayer
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let mut attributes = SmallVec::new();
         let mut visited_metrics = SmallVec::new();
         let mut metric_visitor = MetricVisitor {
@@ -409,6 +456,17 @@ where
             visited_metrics: &mut visited_metrics,
         };
         event.record(&mut metric_visitor);
+
+        if let Some(span) = ctx.event_span(event) {
+            if let Some(contextual_attributes) = span.extensions().get::<ContextualAttributes>() {
+                contextual_attributes
+                    .attributes
+                    .iter()
+                    .for_each(|(key, value)| {
+                        attributes.push(KeyValue::new(key.clone(), value.clone()));
+                    });
+            }
+        }
 
         // associate attrivutes with visited metrics
         visited_metrics
@@ -446,7 +504,21 @@ where
         id: &tracing_core::span::Id,
         ctx: Context<'_, S>,
     ) {
-        self.inner.on_new_span(attrs, id, ctx)
+        if self.collect_contextual_attributes {
+            let span = ctx.span(id).expect("span must already exist!");
+            let mut contextual_attributes = ContextualAttributes::from_record(
+                &Record::new(attrs.values()),
+                self.contextual_attributes_filter,
+            );
+
+            if let Some(parent) = span.parent() {
+                if let Some(parent_attributes) = parent.extensions().get::<ContextualAttributes>() {
+                    contextual_attributes.extend_from_attributes(parent_attributes, false);
+                }
+            }
+
+            span.extensions_mut().insert(contextual_attributes);
+        }
     }
 
     fn max_level_hint(&self) -> Option<tracing_core::LevelFilter> {
@@ -455,11 +527,22 @@ where
 
     fn on_record(
         &self,
-        span: &tracing_core::span::Id,
+        id: &tracing_core::span::Id,
         values: &tracing_core::span::Record<'_>,
         ctx: Context<'_, S>,
     ) {
-        self.inner.on_record(span, values, ctx)
+        if self.collect_contextual_attributes {
+            let span = ctx.span(id).expect("span must already exist!");
+            let contextual_attributes =
+                ContextualAttributes::from_record(values, self.contextual_attributes_filter);
+
+            let ext = &mut span.extensions_mut();
+            if let Some(existing) = ext.get_mut::<ContextualAttributes>() {
+                existing.extend_from_attributes(&contextual_attributes, true);
+            } else {
+                ext.insert(contextual_attributes);
+            }
+        }
     }
 
     fn on_follows_from(
@@ -497,6 +580,75 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+struct ContextualAttributes {
+    attributes: OrderMap<Key, Value>,
+    filter: Option<fn(&Key) -> bool>,
+}
+
+impl Default for ContextualAttributes {
+    fn default() -> Self {
+        ContextualAttributes {
+            attributes: OrderMap::default(),
+            filter: None,
+        }
+    }
+}
+
+impl ContextualAttributes {
+    fn with_filter(&self, filter: Option<fn(&Key) -> bool>) -> Self {
+        ContextualAttributes {
+            attributes: self.attributes.clone(),
+            filter,
+        }
+    }
+
+    fn from_record(record: &Record<'_>, filter: Option<fn(&Key) -> bool>) -> Self {
+        let mut attributes = ContextualAttributes::default().with_filter(filter);
+
+        record.record(&mut attributes);
+        attributes
+    }
+
+    fn extend_from_attributes(&mut self, other: &Self, overwrite_existing: bool) {
+        if overwrite_existing {
+            self.attributes.extend(other.attributes.clone().into_iter());
+        } else {
+            other.attributes.iter().for_each(|(key, value)| {
+                if !self.attributes.contains_key(key) {
+                    self.attributes.insert(key.clone(), value.clone());
+                }
+            });
+        }
+    }
+
+    fn insert(&mut self, key: impl Into<Key>, value: impl Into<Value>) {
+        if self.filter.is_none() {
+            self.attributes.insert_full(key.into(), value.into());
+        } else {
+            let key: Key = key.into();
+            let filter = self.filter.unwrap();
+            if filter(&key) {
+                self.attributes.insert_full(key, value.into());
+            }
+        }
+    }
+}
+
+impl Visit for ContextualAttributes {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.insert(field.name(), value.to_owned());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.insert(field.name(), value);
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.insert(field.name(), format!("{:?}", value));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,7 +666,7 @@ mod tests {
 
     #[test]
     fn filter_layer_should_filter_non_metrics_event() {
-        let layer = PanicLayer.with_filter(MetricsFilter);
+        let layer = PanicLayer.with_filter(MetricsFilter::default());
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
